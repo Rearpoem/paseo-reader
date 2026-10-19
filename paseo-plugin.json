@@ -2,7 +2,7 @@
   "id": "novel-reader",
   "name": "小说",
   "description": "本地 TXT / EPUB 书架、章节目录与阅读进度",
-  "media": [],
+  "media": ["assets/reader-sidebar.png"],
   "build": [["npm", "ci", "--omit=dev", "--ignore-scripts"]],
   "requirements": {
     "paseo": ">=0.11.1"
