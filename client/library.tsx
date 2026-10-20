@@ -3,7 +3,8 @@ import { View, Text, Pressable, ScrollView, TextInput, Platform, type TextStyle 
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useRpc, type PluginHostProps, type PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
 import type { PluginTheme } from "@getpaseo/plugin";
-import { listBooks, browseFiles, importBook, readPage, savePosition, savePreferences, type Book, type Preferences, type Position } from "../shared/library";
+import { listBooks, browseFiles, importBook, startUpload, appendUpload, finishUpload, cancelUpload, MAX_BOOK_BYTES, UPLOAD_CHUNK_BYTES, readPage, savePosition, savePreferences, type Book, type Preferences, type Position, type Encoding } from "../shared/library";
+import { supportsFileSelection, selectBookFile, type SelectedBookFile, type FileSelection } from "./web";
 
 type Colors = PluginTheme["colors"];
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error)).replace(/^Request failed:\s*/, "").replace(/\s+requestType=.*$/, "");
@@ -44,7 +45,7 @@ function Library({ theme, host, layout }: PluginHostProps) {
   const [notice, setNotice] = useState("");
   const spacing = layout.compact ? 16 : 32;
   if (reading && library.data) return <Reader key={reading.id} book={reading} initialPreferences={library.data.preferences} colors={c} compact={layout.compact} onExit={() => { setReading(null); void queryClient.invalidateQueries({ queryKey: ["novels", host.id] }); }} />;
-  if (importing) return <Importer colors={c} compact={layout.compact} hostLabel={host.label} onClose={() => setImporting(false)} onImported={(book, duplicate) => {
+  if (importing) return <Importer colors={c} compact={layout.compact} hostId={host.id} hostLabel={host.label} onClose={() => setImporting(false)} onImported={(book, duplicate) => {
     setImporting(false); setNotice(duplicate ? `《${book.title}》已在书架中，保留了原来的阅读进度。` : `《${book.title}》已加入书架。`); void library.refetch();
   }} />;
   const books = library.data?.books ?? [];
@@ -85,25 +86,135 @@ function Library({ theme, host, layout }: PluginHostProps) {
   </ScrollView>;
 }
 
-function Importer({ colors: c, compact, hostLabel, onClose, onImported }: { colors: Colors; compact: boolean; hostLabel: string; onClose: () => void; onImported: (book: Book, duplicate: boolean) => void }) {
+function FileUploader({ colors: c, encoding, hostLabel, onBusy, onImported }: { colors: Colors; encoding: Encoding; hostLabel: string; onBusy: (busy: boolean) => void; onImported: (book: Book, duplicate: boolean) => void }) {
+  const begin = useRpc(startUpload);
+  const append = useRpc(appendUpload);
+  const finish = useRpc(finishUpload);
+  const cancel = useRpc(cancelUpload);
+  const [file, setFile] = useState<SelectedBookFile | null>(null);
+  const [error, setError] = useState<unknown>(null);
+  const [picking, setPicking] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [phase, setPhase] = useState<"idle" | "uploading" | "finishing" | "cancelling">("idle");
+  const [notice, setNotice] = useState("");
+  const selection = useRef<FileSelection | null>(null);
+  const active = useRef<{ cancelled: boolean; finishing?: boolean; id?: string } | null>(null);
+  const mounted = useRef(true);
+  const cancelRpc = useRef(cancel);
+  cancelRpc.current = cancel;
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      selection.current?.cancel();
+      if (active.current) {
+        active.current.cancelled = true;
+        if (active.current.id) void cancelRpc.current({ id: active.current.id }).catch(() => {});
+      }
+    };
+  }, []);
+  const upload = useMutation({
+    mutationFn: async ({ selected, encoding: selectedEncoding }: { selected: SelectedBookFile; encoding: Encoding }) => {
+      const run: { cancelled: boolean; finishing?: boolean; id?: string } = { cancelled: false };
+      active.current = run;
+      setProgress(0); setPhase("uploading"); setError(null); setNotice("");
+      try {
+        const started = await begin({ filename: selected.name, size: selected.size, encoding: selectedEncoding });
+        run.id = started.id;
+        for (let offset = 0; offset < selected.size; offset += UPLOAD_CHUNK_BYTES) {
+          if (run.cancelled) return null;
+          const base64 = await selected.readChunk(offset, UPLOAD_CHUNK_BYTES);
+          if (run.cancelled) return null;
+          const result = await append({ id: run.id, offset, base64 });
+          if (mounted.current) setProgress(Math.round(result.received / selected.size * 100));
+        }
+        if (run.cancelled) return null;
+        run.finishing = true;
+        if (mounted.current) setPhase("finishing");
+        return await finish({ id: run.id });
+      } catch (err) {
+        if (run.cancelled) return null;
+        throw err;
+      } finally {
+        if (run.id) void cancelRpc.current({ id: run.id }).catch(() => {});
+        if (active.current === run) active.current = null;
+      }
+    },
+    onSuccess: result => { if (mounted.current && result) onImported(result.book, result.duplicate); },
+    onError: err => { if (mounted.current) setError(err); },
+    onSettled: () => { if (mounted.current) { setPhase("idle"); onBusy(false); } },
+  });
+  const choose = async () => {
+    setError(null); setNotice(""); setPicking(true); onBusy(true);
+    try {
+      const picker = selectBookFile();
+      selection.current = picker;
+      const selected = await picker.result;
+      if (!mounted.current || !selected) return;
+      setFile(null);
+      if (!/^[^/\\\x00-\x1f]+\.(txt|epub)$/i.test(selected.name) || selected.name.length > 255) throw new Error("请选择 TXT 或 EPUB 小说文件，文件名需在 255 个字符以内。");
+      if (selected.size > MAX_BOOK_BYTES) throw new Error("单本文件上限为 50 MB，请拆分后上传。");
+      if (!selected.size) throw new Error("这个文件是空的，请选择有正文的 TXT 或 EPUB。");
+      setFile(selected);
+    } catch (err) { if (mounted.current) setError(err); }
+    finally { selection.current = null; if (mounted.current) { setPicking(false); onBusy(false); } }
+  };
+  const stop = () => {
+    const run = active.current;
+    if (!run || run.finishing) return;
+    run.cancelled = true;
+    setPhase("cancelling"); setNotice("已取消上传，文件未加入书架。");
+    if (run.id) void cancel({ id: run.id }).catch(() => {});
+  };
+  return <View style={{ gap: 12 }}>
+    <Text style={{ color: c.foregroundMuted, fontSize: 13, lineHeight: 21 }}>从当前设备选择文件，上传到 {hostLabel} 的书架。支持 TXT / EPUB，单本上限 50 MB。</Text>
+    <Button colors={c} disabled={upload.isPending || picking} onPress={() => { void choose(); }}>{picking ? "等待选择文件…" : file ? "重新选择文件" : "选择文件"}</Button>
+    {picking && <Button colors={c} onPress={() => selection.current?.cancel()}>取消选择</Button>}
+    {file && <View style={{ padding: 14, gap: 7, backgroundColor: c.surface1, borderRadius: 7 }}>
+      <Text selectable style={{ color: c.foreground, fontSize: 15 }}>{file.name}</Text>
+      <Text style={{ color: c.foregroundMuted, fontSize: 12 }}>{file.size >= 1024 * 1024 ? `${(file.size / 1024 / 1024).toFixed(2)} MB` : `${Math.max(1, Math.ceil(file.size / 1024))} KB`}</Text>
+    </View>}
+    <Button colors={c} primary disabled={!file || picking || upload.isPending} onPress={() => { if (file) { onBusy(true); upload.mutate({ selected: file, encoding }); } }}>
+      {phase === "finishing" ? "正在解析并加入书架…" : phase === "cancelling" ? "正在取消…" : upload.isPending ? `正在上传 ${progress}%` : "上传到书架"}
+    </Button>
+    {upload.isPending && <View accessibilityRole="progressbar" accessibilityValue={{ min: 0, max: 100, now: progress }} accessibilityLabel="小说上传进度" style={{ height: 5, backgroundColor: c.surface2, borderRadius: 3, overflow: "hidden" }}>
+      <View style={{ height: 5, width: `${progress}%`, backgroundColor: c.accent }} />
+    </View>}
+    {phase === "uploading" && <Button colors={c} onPress={stop}>取消上传</Button>}
+    {!!notice && <Text accessibilityLiveRegion="polite" style={{ color: c.foregroundMuted, fontSize: 13 }}>{notice}</Text>}
+    <ErrorMessage error={error} colors={c} />
+    {!!error && file && <Text style={{ color: c.foregroundMuted, fontSize: 12, lineHeight: 20 }}>未完成的上传不会加入书架。可以重新选择文件，或点击“上传到书架”重试。</Text>}
+  </View>;
+}
+
+function Importer({ colors: c, compact, hostId, hostLabel, onClose, onImported }: { colors: Colors; compact: boolean; hostId: string; hostLabel: string; onClose: () => void; onImported: (book: Book, duplicate: boolean) => void }) {
   const browse = useRpc(browseFiles);
   const importFile = useRpc(importBook);
   const [folder, setFolder] = useState("~/Downloads");
   const [input, setInput] = useState("");
   const [filter, setFilter] = useState("");
-  const [encoding, setEncoding] = useState<"auto" | "utf-8" | "gb18030" | "utf-16le" | "utf-16be">("auto");
-  const listing = useQuery({ queryKey: ["novel-files", folder, filter], queryFn: () => browse({ path: folder, query: filter }), retry: false });
+  const canUpload = supportsFileSelection();
+  const [mode, setMode] = useState<"upload" | "host">(canUpload ? "upload" : "host");
+  const [uploadBusy, setUploadBusy] = useState(false);
+  const [encoding, setEncoding] = useState<Encoding>("auto");
+  const listing = useQuery({ queryKey: ["novel-files", hostId, folder, filter], queryFn: () => browse({ path: folder, query: filter }), retry: false, enabled: mode === "host" });
   const importing = useMutation({ mutationFn: () => importFile({ path: input.trim(), encoding }), onSuccess: result => onImported(result.book, result.duplicate) });
+  const busy = uploadBusy || importing.isPending;
   const changeFolder = (path: string) => { setFolder(path); setFilter(""); importing.reset(); };
   return <ScrollView style={{ flex: 1, backgroundColor: c.surface0 }} contentContainerStyle={{ padding: compact ? 16 : 28, gap: 15 }}>
-    <View style={{ flexDirection: "row", alignItems: "center", gap: 16 }}><Button colors={c} disabled={importing.isPending} onPress={onClose}>返回书架</Button><Text style={{ color: c.foreground, fontSize: 23, fontWeight: "600" }}>导入小说</Text></View>
+    <View style={{ flexDirection: "row", alignItems: "center", gap: 16 }}><Button colors={c} disabled={busy} onPress={onClose}>返回书架</Button><Text style={{ color: c.foreground, fontSize: 23, fontWeight: "600" }}>导入小说</Text></View>
+    {canUpload ? <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+      <Button colors={c} primary={mode === "upload"} disabled={busy} onPress={() => setMode("upload")}>上传文件</Button>
+      <Button colors={c} primary={mode === "host"} disabled={busy} onPress={() => setMode("host")}>主机文件</Button>
+    </View> : <Text style={{ color: c.foregroundMuted, fontSize: 13, lineHeight: 21 }}>此客户端可导入主机文件；从设备选择文件上传，请使用 Paseo 桌面端或浏览器。</Text>}
+    <View style={{ flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 7 }}><Text style={{ color: c.foregroundMuted, fontSize: 13 }}>TXT 编码</Text>
+      {([['auto','自动'],['utf-8','UTF-8'],['gb18030','GB18030'],['utf-16le','UTF-16 LE'],['utf-16be','UTF-16 BE']] as const).map(([value, title]) => <Button key={value} colors={c} primary={encoding === value} disabled={busy} onPress={() => setEncoding(value)}>{title}</Button>)}
+    </View>
+    {mode === "upload" ? <FileUploader colors={c} encoding={encoding} hostLabel={hostLabel} onBusy={setUploadBusy} onImported={onImported} /> : <>
     <Text style={{ color: c.foregroundMuted, fontSize: 13, lineHeight: 21 }}>选择 {hostLabel} 上的 TXT / EPUB 文件，或直接粘贴完整路径。单本上限 50 MB。</Text>
     <View style={{ flexDirection: compact ? "column" : "row", gap: 8 }}>
       <Field value={input} onChangeText={setInput} placeholder="例如 /Users/你的用户名/Downloads/小说.epub" label="小说文件路径" colors={c} onSubmit={() => { if (input.trim() && !importing.isPending) importing.mutate(); }} />
       <Button colors={c} primary disabled={!input.trim() || importing.isPending} onPress={() => importing.mutate()}>{importing.isPending ? "正在导入…" : "导入到书架"}</Button>
-    </View>
-    <View style={{ flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 7 }}><Text style={{ color: c.foregroundMuted, fontSize: 13 }}>TXT 编码</Text>
-      {([['auto','自动'],['utf-8','UTF-8'],['gb18030','GB18030'],['utf-16le','UTF-16 LE'],['utf-16be','UTF-16 BE']] as const).map(([value, title]) => <Button key={value} colors={c} primary={encoding === value} onPress={() => setEncoding(value)}>{title}</Button>)}
     </View>
     <ErrorMessage error={importing.error} colors={c} />
     <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
@@ -124,6 +235,7 @@ function Importer({ colors: c, compact, hostLabel, onClose, onImported }: { colo
       </Pressable>)}
       {listing.data?.truncated && <Text style={{ color: c.foregroundMuted, padding: 16 }}>只显示前 500 项，请输入名称缩小范围。</Text>}
     </View>
+    </>}
   </ScrollView>;
 }
 

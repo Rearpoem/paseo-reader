@@ -3,7 +3,7 @@ import path from "node:path";
 import os from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
-import { bookSchema, preferencesSchema, type Book, type Position, type Preferences } from "../shared/library";
+import { MAX_BOOK_BYTES, bookSchema, preferencesSchema, type Book, type Position, type Preferences } from "../shared/library";
 import { parseTxt, parseEpub, type ParsedBook } from "./parse";
 
 const dataDir = path.join(process.env.PASEO_HOME || path.join(os.homedir(), ".paseo"), "plugin-data", "novel-reader");
@@ -72,19 +72,26 @@ export async function importFile({ path: input, encoding }: { path: string; enco
   try {
     const stat = await fs.stat(source);
     if (!stat.isFile()) throw new Error("NOT_FILE");
-    if (stat.size > 50 * 1024 * 1024) throw new Error("TOO_LARGE");
+    if (stat.size > MAX_BOOK_BYTES) throw new Error("TOO_LARGE");
     bytes = await fs.readFile(source);
-    if (bytes.length > 50 * 1024 * 1024) throw new Error("TOO_LARGE");
+    if (bytes.length > MAX_BOOK_BYTES) throw new Error("TOO_LARGE");
   } catch (error) {
     if ((error as Error).message === "TOO_LARGE") throw new Error("单本文件上限为 50 MB，请拆分或压缩正文后导入。");
     throw new Error("找不到小说文件或无法读取。请检查路径和文件权限。");
   }
-  const parsed = extension === ".epub" ? parseEpub(bytes, source) : parseTxt(bytes, source, encoding);
+  return importBytes(bytes, path.basename(source), encoding);
+}
+
+export async function importBytes(bytes: Buffer, filename: string, encoding: string) {
+  const extension = path.extname(filename).toLowerCase();
+  if (![".txt", ".epub"].includes(extension)) throw new Error("目前支持 TXT 和 EPUB，请选择对应格式的小说文件。");
+  if (bytes.length > MAX_BOOK_BYTES) throw new Error("单本文件上限为 50 MB，请拆分后导入。");
+  const parsed = extension === ".epub" ? parseEpub(bytes, filename) : parseTxt(bytes, filename, encoding);
   const id = createHash("sha256").update(bytes).update(parsed.encoding).digest("hex").slice(0, 24);
   return mutate(async library => {
     const existing = library.books.find(book => book.id === id);
     if (existing) return { book: existing, duplicate: true };
-    const book: Book = { id, title: parsed.title, author: parsed.author, format: extension === ".epub" ? "EPUB" : "TXT", filename: path.basename(source), encoding: parsed.encoding,
+    const book: Book = { id, title: parsed.title, author: parsed.author, format: extension === ".epub" ? "EPUB" : "TXT", filename: path.basename(filename), encoding: parsed.encoding,
       pageCount: parsed.pages.length, chapterCount: parsed.chapters.length, addedAt: Date.now(), lastReadAt: 0, position: { page: 0, offset: 0 } };
     await atomicWrite(path.join(dataDir, "books", `${id}.json`), parsed);
     library.books.push(book);
